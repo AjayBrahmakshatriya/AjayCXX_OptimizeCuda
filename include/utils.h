@@ -16,12 +16,14 @@ static float run_and_time(std::function<void(int)> f, int runs, int warm_up_runs
 		f(-1);	
 	}	
 
+	cudaDeviceSynchronize();
 	// Actual timed runs
 	long long start_time = get_time_in_us();
 	for (int i = 0; i < runs; i++) {
 		f(i);
 	}
-	// It is the f's job to synchronize for CUDA
+	// Synchronize before we time
+	cudaDeviceSynchronize();
 	long long stop_time = get_time_in_us();
 	
 	return ((float)(stop_time - start_time)) / 1000.0;	
