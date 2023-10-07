@@ -2,7 +2,7 @@
 #include "utils.h"
 #include <iostream>
 
-
+#define CTA_SIZE (512)
 void __global__ SpMV (matrix_t A, float * d_B, float * d_C, uint32_t num_rows, uint32_t num_blocks) {
 
 	int thread_id = blockIdx.x * blockDim.x + threadIdx.x;
@@ -37,7 +37,8 @@ void __global__ SpMV_co_warp (matrix_t A, float * d_B, float * d_C, uint32_t num
 
 	int lane_id = thread_id % 32;
 
-	d_C[rid] = 0.0;
+	if (lane_id == 0)		
+		d_C[rid] = 0.0;
 
 	// LaneID 1: 0, 32, 64, 96th non zero the row
 	// LaneID 2: 1, 33, 65, 97th non zero the row
@@ -47,15 +48,104 @@ void __global__ SpMV_co_warp (matrix_t A, float * d_B, float * d_C, uint32_t num
 		uint32_t col = A.d_cols[cidx];
 		float val = A.d_values[cidx];
 
-		d_C[rid] += val * d_B[col];
+		//d_C[rid] += val * d_B[col];
+		atomicAdd(&d_C[rid], val * d_B[col]);
 	}
 
 }
 
+void __global__ SpMV_WM (matrix_t A, float * d_B, float * d_C, uint32_t num_rows) {	
+	int thread_id = blockIdx.x * blockDim.x + threadIdx.x;
+	int lane_id = thread_id  % 32;
+	int chunk_id = threadIdx.x / 32;
+	int chunk_off = chunk_id * 32;
+
+	int32_t __shared__ shared_deg[CTA_SIZE];
+	uint32_t __shared__ shared_row[CTA_SIZE];
+	uint32_t __shared__ shared_rptr[CTA_SIZE];	
+
+	if (thread_id < num_rows) {
+		shared_row[threadIdx.x] = thread_id;
+		shared_rptr[threadIdx.x] = A.d_row_ptrs[thread_id];
+		shared_deg[threadIdx.x] = A.d_row_ptrs[thread_id + 1] - A.d_row_ptrs[thread_id];
+
+		d_C[thread_id] = 0;
+	} else {
+		shared_row[threadIdx.x] = 0;
+		shared_rptr[threadIdx.x] = 0;
+		shared_deg[threadIdx.x] = 0;
+	}
+	__syncthreads();
+	// Prefix sum	
+	int32_t deg = shared_deg[threadIdx.x];	
+
+	for (uint32_t d = 1; d < 32; d *=2) {
+		int32_t tmp = __shfl_up_sync((unsigned)-1, deg, d);
+		if (lane_id >= d) deg += tmp;
+	}
+
+
+	int32_t tot_deg = __shfl_sync((unsigned)-1, deg, 31);
+	
+	if (lane_id == 31) deg = 0;
+	shared_deg[chunk_off + (lane_id + 1) % 32] = deg; // __shfl_sync((unsigned)-1, deg, lane_id);
+
+	__syncthreads();
+
+	int warp_end = thread_id - lane_id + 32;
+	if (warp_end > num_rows) warp_end = num_rows;
+	int len = warp_end - (thread_id - lane_id);
+
+	for (int nnzid = lane_id; nnzid < tot_deg; nnzid += 32) {
+		int ridx = binary_search_upperbound(shared_deg + chunk_off, len, nnzid) - 1;
+		
+		uint32_t rid = shared_row[chunk_off + ridx];
+		uint32_t rptr = shared_rptr[chunk_off + ridx] + nnzid - shared_deg[chunk_off + ridx];
+
+		uint32_t col = A.d_cols[rptr];
+		float val = A.d_values[rptr];
+
+		atomicAdd(&d_C[rid], val * d_B[col]);	
+	}
+	
+}
+
+void __global__ SpMV_EO_init(matrix_t A, float * d_B, float *d_C, uint32_t num_rows) {
+	int thread_id = blockIdx.x * blockDim.x + threadIdx.x;
+	if (thread_id < num_rows) 
+		d_C[thread_id] = 0;
+}
+
+void __global__ SpMV_EO (matrix_t A, float * d_B, float * d_C, uint32_t num_rows) {
+	int thread_id = blockIdx.x * blockDim.x + threadIdx.x;
+	int num_threads = blockDim.x * gridDim.x;
+
+	for (int nnzid = thread_id; nnzid < A.num_values; nnzid += num_threads) {
+		int rid = A.d_rows[nnzid];
+		int cid = A.d_cols[nnzid];
+		float val = A.d_values[nnzid];		
+
+		atomicAdd(&d_C[rid], val * d_B[cid]);	
+	}
+}
+
+void __global__ SpMV_EO_Blocked(matrix_t A, float * d_B, float * d_C, uint32_t block_start, uint32_t block_end) {
+	int thread_id = blockIdx.x * blockDim.x + threadIdx.x;
+	int num_threads = blockDim.x * gridDim.x;
+
+	for (int nnzid = thread_id + block_start; nnzid < block_end; nnzid += num_threads) {
+		int rid = A.d_rows_blocked[nnzid];
+		int cid = A.d_cols_blocked[nnzid];
+		float val = A.d_values_blocked[nnzid];		
+
+		atomicAdd(&d_C[rid], val * d_B[cid]);	
+	}
+}
 
 int main(int argc, char* argv[]) {
 	assert(argc >= 2 && "Usage: executable <matrix name>");
-	matrix_t A = load_matrix(argv[1]);
+	matrix_t A = load_matrix(argv[1], 800000);
+	
 
 		
 	std::cout << A.num_rows << " " << A.num_values << std::endl;
@@ -101,22 +191,71 @@ int main(int argc, char* argv[]) {
 
 	ttr = run_and_time([&] (int rid) {
 		SpMV<<<num_blocks, block_size>>> (A, d_B, d_C, A.num_rows, num_blocks);
-		cudaCheckLastError();
 	}, 100, 10);
+	cudaCheckLastError();
+
 	std::cout << "Execution time [Basic] = " << ttr << "(ms)" << std::endl;
 
 	// Running Co-warp version - 32 threads in warp simulataneusly process a row
 	block_size = 512;	
 	num_blocks = (A.num_rows * 32 + block_size - 1) / block_size;
 
-	cudaMemcpy(h_C, d_C, sizeof(float) * A.num_rows, cudaMemcpyDeviceToHost);
 
 	ttr = run_and_time([&] (int rid) {
 		SpMV_co_warp<<<num_blocks, block_size>>> (A, d_B, d_C, A.num_rows, num_blocks);
-		cudaCheckLastError();
 	}, 100, 10);
+	cudaCheckLastError();
+
 	std::cout << "Execution time [Co-Warp] = " << ttr << "(ms)" << std::endl;
-	
+
+
+	// Running WM version - Threads is a warp collaboratively process non zeros
+	// in a load balanced way
+	block_size = CTA_SIZE;	
+	num_blocks = (A.num_rows + block_size - 1) / block_size;
+
+	ttr = run_and_time([&] (int rid) {
+		SpMV_WM<<<num_blocks, block_size>>> (A, d_B, d_C, A.num_rows);
+	}, 100, 10);
+	cudaCheckLastError();
+	std::cout << "Execution time [WM] = " << ttr << "(ms)" << std::endl;
+
+	// Running EO version - All threads collaboratively process all non-zeros in COO format
+	ttr = run_and_time([&] (int rid) {
+		block_size = CTA_SIZE;	
+		num_blocks = (A.num_rows + block_size - 1) / block_size;
+		SpMV_EO_init<<<num_blocks, block_size>>> (A, d_B, d_C, A.num_rows);
+		
+		block_size = 512;
+		num_blocks = 80;
+
+		SpMV_EO<<<num_blocks, block_size>>> (A, d_B, d_C, A.num_rows);
+
+	}, 100, 10);
+	cudaCheckLastError();
+	std::cout << "Execution time [EO] = " << ttr << "(ms)" << std::endl;
+
+
+	// Running EO Blocked version - All threads collaboratively process all non-zeros in COO format
+	// COO is partitioned into blocks for better locality
+	ttr = run_and_time([&] (int rid) {
+		block_size = CTA_SIZE;	
+		num_blocks = (A.num_rows + block_size - 1) / block_size;
+		SpMV_EO_init<<<num_blocks, block_size>>> (A, d_B, d_C, A.num_rows);
+		
+		block_size = 512;
+		num_blocks = 160;
+		for (int i = 0; i < A.num_blocks; i++) {
+			uint32_t block_start = i == 0?0: A.h_bin_offsets[i-1];
+			uint32_t block_end = A.h_bin_offsets[i];
+			SpMV_EO_Blocked<<<num_blocks, block_size>>> (A, d_B, d_C, block_start, block_end);
+		}
+
+	}, 100, 10);
+	cudaCheckLastError();
+	std::cout << "Execution time [EO Blocked] = " << ttr << "(ms)" << std::endl;
+	cudaMemcpy(h_C, d_C, sizeof(*h_C) * A.num_rows, cudaMemcpyDeviceToHost);
+
 	for (int i = 0; i < A.num_rows; i++) {
 		if (std::abs(h_C[i] - h_C_ref[i]) > 0.001 * h_C_ref[i])
 			printf("mismatch at %d: %f, %f\n", i, h_C[i], h_C_ref[i]);
